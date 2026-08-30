@@ -41,17 +41,13 @@ export const getDocumentById = async (userId: string, docId: string): Promise<Do
   // Sync Draft shares by link: opening someone else's document grants access and
   // records the share so it shows up under "Shared with me".
   if (document.ownerId !== userId) {
-    // A viewer who has not created their profile yet cannot be recorded as a
-    // share; they still get to read the document.
-    const viewer = await prisma.user.findUnique({ where: { userId } });
-
-    if (viewer) {
-      await prisma.documentShare.upsert({
-        where: { documentId_userId: { documentId: docId, userId } },
-        create: { documentId: docId, userId },
-        update: {},
-      });
-    }
+    // Every authenticated caller has a profile (see ensureProfileMiddleware),
+    // so the share can always be recorded.
+    await prisma.documentShare.upsert({
+      where: { documentId_userId: { documentId: docId, userId } },
+      create: { documentId: docId, userId },
+      update: {},
+    });
   }
 
   return document;
