@@ -119,12 +119,28 @@ class TestClient {
     this.flush();
   }
 
+  /** Change the document without trying to send — simulates working offline. */
+  editLocally(content: string) {
+    this.doc = applyContentUpdate(this.doc, content);
+  }
+
   get content() {
     return this.doc.content ?? '';
   }
 
   close() {
     this.socket.disconnect();
+  }
+
+  async reconnect(docId: string): Promise<void> {
+    this.socket.disconnect();
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    this.socket.connect();
+    await new Promise<void>((resolve, reject) => {
+      this.socket.once('connect', () => resolve());
+      this.socket.once('connect_error', reject);
+    });
+    this.join(docId);
   }
 }
 
@@ -204,6 +220,72 @@ describe('document sync over sockets', () => {
     expect(alice.content).toBe(bob.content);
     expect(alice.content).toContain('by alice');
     expect(alice.content).toContain('by bob');
+  });
+
+  // Vercel-style hosting closes sockets when a function reaches its maximum
+  // duration, and any flaky network does the same. A reconnected client must
+  // still be able to deliver its edits.
+  it('keeps syncing after a client reconnects', async () => {
+    const docId = await seedDocument('auth0|alice', ['auth0|bob']);
+
+    const alice = new TestClient('auth0|alice');
+    const bob = new TestClient('auth0|bob');
+    await Promise.all([alice.connected(), bob.connected()]);
+
+    alice.join(docId);
+    bob.join(docId);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    alice.edit('<p>before the drop</p>');
+    await waitUntil(() => bob.content === '<p>before the drop</p>');
+
+    await alice.reconnect(docId);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    alice.edit('<p>before the drop and after</p>');
+
+    await waitUntil(() => bob.content === '<p>before the drop and after</p>');
+    expect(bob.content).toBe('<p>before the drop and after</p>');
+  });
+
+  // The harder case: changes made with no connection at all must still reach
+  // everyone once the client is back.
+  it('delivers edits made while a client was disconnected', async () => {
+    const docId = await seedDocument('auth0|alice', ['auth0|bob']);
+
+    const alice = new TestClient('auth0|alice');
+    const bob = new TestClient('auth0|bob');
+    await Promise.all([alice.connected(), bob.connected()]);
+
+    alice.join(docId);
+    bob.join(docId);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    alice.edit('<p>shared start</p>');
+    await waitUntil(() => bob.content === '<p>shared start</p>');
+
+    // Alice goes away and keeps working locally.
+    alice.socket.disconnect();
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    alice.editLocally('<p>shared start plus offline work</p>');
+
+    // Bob edits main in the meantime, so the two histories diverge.
+    bob.edit('<p>shared start, and bob was here</p>');
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    await alice.reconnect(docId);
+
+    await waitUntil(
+      () =>
+        alice.content.includes('offline work') &&
+        alice.content.includes('bob was here') &&
+        alice.content === bob.content,
+      8000
+    );
+
+    expect(alice.content).toBe(bob.content);
+    expect(alice.content).toContain('offline work');
+    expect(alice.content).toContain('bob was here');
   });
 
   it('refuses to sync a document the user has no access to', async () => {
