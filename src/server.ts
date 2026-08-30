@@ -29,11 +29,16 @@ export class SyncServer {
     })
   }
 
-  async start() {
-    const PORT = process.env.PORT !== undefined ? parseInt(process.env.PORT) : 3030;
+  /**
+   * Wires everything up and hands back the HTTP server without listening.
+   *
+   * Serverless hosts import the server and manage the socket themselves, so
+   * binding a port has to stay separate from building the app.
+   */
+  async build(): Promise<HttpServer> {
     // Connect to PostgreSQL
     await this.connectDBSync();
-    // Connect to local redis server
+    // Connect to Redis
     await this.connectRedisSync();
 
     this.#app.use(express.json());
@@ -45,7 +50,15 @@ export class SyncServer {
     // Socket
     await socket(this.#io, this.#redis);
 
-    this.#server.listen(PORT, () => {
+    return this.#server;
+  }
+
+  async start() {
+    const PORT = process.env.PORT !== undefined ? parseInt(process.env.PORT) : 3030;
+
+    const server = await this.build();
+
+    server.listen(PORT, () => {
       console.log(`[Server] Server is running at http://localhost:${PORT}`);
     })
   }
