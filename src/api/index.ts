@@ -1,10 +1,10 @@
 import { Application, Request, Response, Router } from "express";
-import Redis from "ioredis";
+import { Redis } from "ioredis";
 
-import { userRouter } from "./routes/user";
-import { documentRouter } from "./routes/document";
-import { mergeRouter } from "./routes/merge";
-import { jwtMiddleware } from "../middleware/jwt";
+import { userRouter } from "./routes/user.js";
+import { documentRouter } from "./routes/document.js";
+import { mergeRouter } from "./routes/merge.js";
+import { jwtMiddleware } from "../middleware/jwt.js";
 
 
 export default async (app: Application, redis: Redis) => {

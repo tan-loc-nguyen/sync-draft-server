@@ -1,118 +1,109 @@
-import { Document, DocumentModel, UserModel } from "../model";
-import { mongo, Types } from "mongoose";
-import { removeSharedIdFromProfile } from "./user";
+import { prisma } from '../config/prisma.js';
+import { DocumentModel } from '../generated/prisma/models.js';
+import { ForbiddenError, NotFoundError } from './errors.js';
 
-export const getDocumentsbyUserId = async (userId: string): Promise<Document[]> => {
-  const documents = await DocumentModel.find({ ownerId: userId }).exec();
+// A document may be edited by its owner and by anyone it has been shared with.
+// Deleting is owner-only and checked separately.
+export const assertCanEdit = async (userId: string, docId: string): Promise<void> => {
+  const document = await prisma.document.findUnique({
+    where: { id: docId },
+    include: { shares: { where: { userId } } },
+  });
 
-  return documents;
+  if (!document) {
+    throw new NotFoundError('Document not found!');
+  }
+
+  if (document.ownerId !== userId && document.shares.length === 0) {
+    throw new ForbiddenError('You do not have access to this document');
+  }
 };
 
-export const getDocumentById = async (userId: string, docId: Types.ObjectId | string): Promise<Document> => {
-  const document = await DocumentModel.findById(docId).exec();
-  
+export const getDocumentsByOwner = async (userId: string): Promise<DocumentModel[]> =>
+  prisma.document.findMany({
+    where: { ownerId: userId },
+    orderBy: { updatedAt: 'desc' },
+  });
+
+export const getSharedDocuments = async (userId: string): Promise<DocumentModel[]> =>
+  prisma.document.findMany({
+    where: { shares: { some: { userId } } },
+    orderBy: { updatedAt: 'desc' },
+  });
+
+export const getDocumentById = async (userId: string, docId: string): Promise<DocumentModel | null> => {
+  const document = await prisma.document.findUnique({ where: { id: docId } });
+
   if (!document) {
-    await removeSharedIdFromProfile(userId, docId);
-    throw new Error('Document not found!');
+    return null;
+  }
+
+  // Sync Draft shares by link: opening someone else's document grants access and
+  // records the share so it shows up under "Shared with me".
+  if (document.ownerId !== userId) {
+    // A viewer who has not created their profile yet cannot be recorded as a
+    // share; they still get to read the document.
+    const viewer = await prisma.user.findUnique({ where: { userId } });
+
+    if (viewer) {
+      await prisma.documentShare.upsert({
+        where: { documentId_userId: { documentId: docId, userId } },
+        create: { documentId: docId, userId },
+        update: {},
+      });
+    }
   }
 
   return document;
 };
 
-export const createDocument = async (userId: string): Promise<Document> => {
-  const date = new Date();
+export const createDocument = async (userId: string): Promise<DocumentModel> =>
+  prisma.document.create({
+    data: { ownerId: userId, title: 'Untitled', content: null },
+  });
 
-  const newDoc = await (new DocumentModel({
-    _id: new mongo.ObjectId(),
-    ownerId: userId,
-    title: 'Untitled',
-    content: null,
-    createdAt: date,
-    updatedAt: date,
-    merges: []
-  }))
-  .save();
+export const updateDocumentTitle = async (
+  userId: string,
+  docId: string,
+  newTitle: string
+): Promise<DocumentModel> => {
+  await assertCanEdit(userId, docId);
 
-  // Add docId to their profile
-  await UserModel.findOneAndUpdate(
-    {
-      userId : userId
-    },
-    {
-      $addToSet: { documents: newDoc._id }
-    },
-    { new: true }
-  )
+  return prisma.document.update({
+    where: { id: docId },
+    data: { title: newTitle },
+  });
+};
 
-  return newDoc;
-}
+export const updateDocument = async (docId: string, content: string): Promise<DocumentModel> =>
+  prisma.document.update({
+    where: { id: docId },
+    data: { content },
+  });
 
-export const deleteDocumentById = async (userId: string, docId: Types.ObjectId | string): Promise<void> => {
-  const result = await DocumentModel.findByIdAndDelete(docId);
+export const deleteDocumentById = async (userId: string, docId: string): Promise<void> => {
+  const document = await prisma.document.findUnique({ where: { id: docId } });
 
-  await UserModel.findOneAndUpdate(
-    {
-      userId: userId
-    },
-    {
-      $pull: { documents: docId }
-    },
-    { new: true }
-  );
-
-  if (!result) {
-    throw new Error('Document not found!')
-  }
-}
-
-export const updateDocument= async (docId: Types.ObjectId | string, content: string): Promise<Document> => {
-  const updatedDoc = await DocumentModel.findByIdAndUpdate(
-    docId,
-    {
-      content: content,
-      updatedAt: new Date()
-    },
-    { new: true }
-  ).exec();
-
-  if (!updatedDoc) {
-    throw new Error('Document not found!');
+  if (!document) {
+    throw new NotFoundError('Document not found!');
   }
 
-  return updatedDoc;
-}
-
-export const updateDocumentTitle = async (docId: Types.ObjectId | string, newTitle: string): Promise<Document> => {
-  const updatedDoc = await DocumentModel.findByIdAndUpdate(
-    docId,
-    {
-      title: newTitle,
-      updatedAt: new Date()
-    },
-    { new: true }
-  ).exec();
-
-  if (!updatedDoc) {
-    throw new Error('Document not found!');
+  if (document.ownerId !== userId) {
+    throw new ForbiddenError('Only the owner can delete this document');
   }
 
-  return updatedDoc;
-}
+  // Shares and merges cascade away with the row.
+  await prisma.document.delete({ where: { id: docId } });
+};
 
+// Server-internal read used by the sync layer to seed a document's CRDT from
+// whatever HTML was stored before. Access is already checked when the socket
+// joins the room.
+export const getDocumentContent = async (docId: string): Promise<string | null> => {
+  const document = await prisma.document.findUnique({
+    where: { id: docId },
+    select: { content: true },
+  });
 
-export const addMergeId = async (docId: Types.ObjectId | string, mergeId: Types.ObjectId | string): Promise<Document> => {
-  const addedDoc = await DocumentModel.findByIdAndUpdate(
-    docId,
-    {
-      $addToSet: { merges: docId },
-      updatedAt: new Date()
-    },
-    { new: true }
-  ).exec();
-
-  if (!addedDoc) {
-    throw new Error('Document not found!');
-  }
-
-  return addedDoc;
-}
+  return document?.content ?? null;
+};

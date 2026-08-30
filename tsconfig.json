@@ -1,15 +1,16 @@
 {
   "compilerOptions": {
-    "target": "ES6",
-    "module": "CommonJS",
+    "target": "ES2022",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "rootDir": "./src",
     "outDir": "./dist",
     "esModuleInterop": true,
     "allowJs": true,
     "noImplicitAny": true,
-    "moduleResolution": "node",
     "sourceMap": true,
-    "skipLibCheck": true,
-    "baseUrl": "./",
+    "skipLibCheck": true
   },
-  "include": ["src/**/*"]
+  "include": ["src/**/*"],
+  "exclude": ["src/**/*.test.ts", "src/test/**/*"]
 }

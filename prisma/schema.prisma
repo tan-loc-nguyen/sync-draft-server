@@ -1,0 +1,72 @@
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id        String   @id @default(uuid())
+  // Auth0 `sub`. This is the identity every other table points at, so it is
+  // the referenced key rather than `id`.
+  userId    String   @unique
+  email     String
+  createdAt DateTime @default(now())
+
+  documents Document[]
+  shares    DocumentShare[]
+  merges    Merge[]
+
+  @@map("users")
+}
+
+model Document {
+  id      String @id @default(uuid())
+  ownerId String
+  owner   User   @relation(fields: [ownerId], references: [userId], onDelete: Cascade)
+
+  title     String   @default("Untitled")
+  // HTML today. Phase 3 replaces this with the Automerge binary.
+  content   String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  shares DocumentShare[]
+  merges Merge[]
+
+  @@index([ownerId])
+  @@map("documents")
+}
+
+// Replaces the hand-maintained `user.shared[]` array. A row here is the single
+// source of truth for "this document is shared with this user", and it is
+// removed automatically when either side is deleted.
+model DocumentShare {
+  documentId String
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  userId     String
+  user       User     @relation(fields: [userId], references: [userId], onDelete: Cascade)
+  createdAt  DateTime @default(now())
+
+  @@id([documentId, userId])
+  @@index([userId])
+  @@map("document_shares")
+}
+
+model Merge {
+  id         String   @id @default(uuid())
+  documentId String
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  mergedById String
+  mergedBy   User     @relation(fields: [mergedById], references: [userId], onDelete: Cascade)
+
+  before      String?
+  after       String?
+  description String?
+  mergedAt    DateTime @default(now())
+
+  @@index([documentId])
+  @@map("merges")
+}

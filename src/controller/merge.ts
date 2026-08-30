@@ -1,23 +1,31 @@
-import { mongo, Types } from "mongoose";
-import { Merge, MergeModel } from "../model";
+import { prisma } from '../config/prisma.js';
+import { MergeModel } from '../generated/prisma/models.js';
+import { assertCanEdit } from './document.js';
 
-export const getMergesByDocId = async (docId: Types.ObjectId | string): Promise<Merge[]> => {
-  const merges = await MergeModel.find({ docId: docId }).exec();
-
-  return merges;
+export interface CreateMergeInput {
+  docId: string;
+  mergedBy: string;
+  before: string | null;
+  after: string | null;
+  description: string | null;
 }
 
-export const createMerge = async (data: Merge): Promise<Merge> => {
-  const newMerge = await (new MergeModel({
-    _id: new mongo.ObjectId(),
-    docId: data.docId,
-    mergedBy: data.mergedBy,
-    before: data.before,
-    after: data.after,
-    mergedAt: new Date(),
-    description: data.description
-  }))
-  .save();
+export const getMergesByDocId = async (docId: string): Promise<MergeModel[]> =>
+  prisma.merge.findMany({
+    where: { documentId: docId },
+    orderBy: { mergedAt: 'desc' },
+  });
 
-  return newMerge;
-}
+export const createMerge = async (data: CreateMergeInput): Promise<MergeModel> => {
+  await assertCanEdit(data.mergedBy, data.docId);
+
+  return prisma.merge.create({
+    data: {
+      documentId: data.docId,
+      mergedById: data.mergedBy,
+      before: data.before,
+      after: data.after,
+      description: data.description,
+    },
+  });
+};

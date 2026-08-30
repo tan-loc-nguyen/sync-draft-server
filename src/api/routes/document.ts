@@ -1,50 +1,75 @@
 import { Request, Response, Router } from "express";
-import Redis from "ioredis";
 
-import { createDocument, deleteDocumentById, getDocumentById, getDocumentsbyUserId, updateDocumentTitle } from "../../controller/document";
-import { BAD_REQUEST, INTERNAL_SERVER_ERROR, NOT_FOUND, OK } from "../status_code";
-import { addSharedIdToProfile, getUserById, removeSharedIdFromProfile } from "../../controller/user";
+import { userIdFrom } from '../auth.js';
+import { Redis } from "ioredis";
+
+import {
+  createDocument,
+  deleteDocumentById,
+  getDocumentById,
+  getDocumentsByOwner,
+  getSharedDocuments,
+  updateDocumentTitle,
+} from "../../controller/document.js";
+import { ForbiddenError, NotFoundError } from "../../controller/errors.js";
+import { BAD_REQUEST, FORBIDDEN, INTERNAL_SERVER_ERROR, NOT_FOUND, OK } from "../status_code.js";
+
+// Maps a controller failure onto the right status code.
+const fail = (res: Response, error: unknown, context: string) => {
+  if (error instanceof ForbiddenError) {
+    return res.status(FORBIDDEN).json({ error: error.message });
+  }
+
+  if (error instanceof NotFoundError) {
+    return res.status(NOT_FOUND).json({ error: error.message });
+  }
+
+  console.error(`[Error] ${context}: ${error}`);
+
+  return res.status(INTERNAL_SERVER_ERROR).json({ error: 'Internal Server Error' });
+};
 
 export const documentRouter = (router: Router, redis: Redis) => {
   router.route('/documents')
-  .get(async (req: Request, res: Response): Promise<any> => {
+  .get(async (req: Request, res: Response): Promise<Response> => {
     try {
       const { q } = req.query;
-      const userId = req.auth.payload.sub;
+      const userId = userIdFrom(req);
 
       if (q === 'mine') {
-        const myDocs = await getDocumentsbyUserId(userId);
-        
-        return res.status(OK).json(myDocs);
-      } else if (q == 'shared') {
-        const user = await getUserById(userId);
+        return res.status(OK).json(await getDocumentsByOwner(userId));
+      }
 
-        if (!user) {
-          return res.status(NOT_FOUND).json(null);
-        }
-
-        const sharedDocs = await Promise.all(user.shared.map(docId => getDocumentById(userId, docId)));
-
-        return res.status(OK).json(sharedDocs);
+      if (q === 'shared') {
+        return res.status(OK).json(await getSharedDocuments(userId));
       }
 
       return res.status(BAD_REQUEST).json({
         error: 'Invalid query params'
       })
     } catch (error) {
-      console.error(`[Error] GET | /documents: ${req.params.userId}: ${error}`);
-      
-      return res.status(INTERNAL_SERVER_ERROR).json({
-        error: 'Internal Server Error'
-      });
+      return fail(res, error, `GET | /documents: ${userIdFrom(req)}`);
+    }
+  })
+  .post(async (req: Request, res: Response): Promise<Response> => {
+    try {
+      const userId = userIdFrom(req);
+
+      const newDoc = await createDocument(userId);
+
+      await redis.set(newDoc.id, '');
+
+      return res.status(OK).json(newDoc);
+    } catch (error) {
+      return fail(res, error, `POST | /documents: ${userIdFrom(req)}`);
     }
   })
 
   router.route('/documents/:docId')
-  .get(async (req: Request, res: Response): Promise<any> => {
+  .get(async (req: Request<{ docId: string }>, res: Response): Promise<Response> => {
     try {
       const { docId } = req.params;
-      const userId = req.auth.payload.sub;
+      const userId = userIdFrom(req);
 
       const doc = await getDocumentById(userId, docId);
 
@@ -52,65 +77,28 @@ export const documentRouter = (router: Router, redis: Redis) => {
         return res.status(NOT_FOUND).json(null)
       }
 
-      if (userId !== doc.ownerId) {
-        await addSharedIdToProfile(userId, docId);
-        console.log(`[Server] ${userId} added ${docId} to shared`)
-      }
-
       return res.status(OK).json(doc);
     } catch (error) {
-      console.error(`[Error] GET | /documents/:docId: ${req.params.docId}: ${error}`);
-      
-      return res.status(INTERNAL_SERVER_ERROR).json({
-        error: 'Internal Server Error'
-      });
+      return fail(res, error, `GET | /documents/:docId: ${req.params.docId}`);
     }
   })
-  
-  router.route('/documents')
-  .post(async (req: Request, res: Response): Promise<any> => {
-    try {
-      const userId = req.auth.payload.sub;
-
-      const newDoc = await createDocument(userId);
-      
-      if (newDoc) {
-        await redis.set(newDoc._id.toString(), '');
-      }
-
-      return res.status(OK).json(newDoc);
-    } catch (error) {
-      console.error(`[Error] POST | /documents: ${req.auth.payload.sub}: ${error}`);
-      
-      return res.status(INTERNAL_SERVER_ERROR).json({
-        error: 'Internal Server Error'
-      });
-    }
-  })
-
-  router.route('/documents/:docId')
-  .put(async (req: Request, res: Response): Promise<any> => {
+  .put(async (req: Request<{ docId: string }>, res: Response): Promise<Response> => {
     try {
       const { docId } = req.params;
       const { newTitle } = req.body;
+      const userId = userIdFrom(req);
 
-      const updatedDocument = await updateDocumentTitle(docId, newTitle);
+      const updatedDocument = await updateDocumentTitle(userId, docId, newTitle);
 
       return res.status(OK).json(updatedDocument);
     } catch (error) {
-      console.error(`[Error] PUT | /documents/:docId: ${req.params.docId}: ${error}`);
-      
-      return res.status(INTERNAL_SERVER_ERROR).json({
-        error: 'Internal Server Error'
-      });
+      return fail(res, error, `PUT | /documents/:docId: ${req.params.docId}`);
     }
   })
-
-  router.route('/documents/:docId')
-  .delete(async (req: Request, res: Response): Promise<any> => {
+  .delete(async (req: Request<{ docId: string }>, res: Response): Promise<Response> => {
     try {
       const { docId } = req.params;
-      const userId = req.auth.payload.sub;
+      const userId = userIdFrom(req);
 
       await deleteDocumentById(userId, docId);
 
@@ -118,11 +106,7 @@ export const documentRouter = (router: Router, redis: Redis) => {
 
       return res.status(OK).json({ message: "success" });
     } catch (error) {
-      console.error(`[Error] DELETE | /documents/:docId: ${req.params.docId}: ${error}`);
-      
-      return res.status(INTERNAL_SERVER_ERROR).json({
-        error: 'Internal Server Error'
-      });
+      return fail(res, error, `DELETE | /documents/:docId: ${req.params.docId}`);
     }
   })
 }

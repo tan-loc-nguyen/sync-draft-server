@@ -1,4 +1,4 @@
-import Redis from "ioredis";
+import { Redis } from "ioredis";
 
 async function connectRedis() {
   try {
@@ -8,13 +8,13 @@ async function connectRedis() {
       // username: "default", // needs Redis >= 6
       // password: process.env.REDIS_PASSWORD || '',
       // db: 0, // Defaults to 0
-      retryStrategy: (times) => Math.min(times * 50, 2000), // Retry with backoff
+      retryStrategy: (times: number) => Math.min(times * 50, 2000), // Retry with backoff
       maxRetriesPerRequest: 5, // Limit retries
     });
 
     const health = await redis.ping();
     if (health === 'PONG') {
-      console.log(`[Redis] Connected to redis: ${process.env.REDIS_HOST}`);
+      console.log(`[Redis] Connected to redis`);
       return redis;
     }
     throw new Error('Failed to connect to redis');

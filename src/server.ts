@@ -2,13 +2,13 @@ import express, { Express } from "express";
 import { Server as SocketIOServer } from 'socket.io';
 import { createServer, Server as HttpServer } from 'http';
 import cors from 'cors';
-import Redis from "ioredis";
-import 'dotenv/config';
+import { Redis } from "ioredis";
+import './config/env.js';
 
-import connectDB from "./config/mongoose";
-import api from "./api";
-import connectRedis from "./config/redis";
-import socket from "./socket";
+import connectPrisma from "./config/prisma.js";
+import api from "./api/index.js";
+import connectRedis from "./config/redis.js";
+import socket from "./socket/index.js";
 
 export class SyncServer {
   #server: HttpServer
@@ -17,7 +17,7 @@ export class SyncServer {
 
   #io: SocketIOServer
 
-  #redis: Redis
+  #redis!: Redis
   constructor() {
     this.#app = express();
     this.#server = createServer(this.#app);
@@ -31,7 +31,7 @@ export class SyncServer {
 
   async start() {
     const PORT = process.env.PORT !== undefined ? parseInt(process.env.PORT) : 3030;
-    // Connect to MongoDB
+    // Connect to PostgreSQL
     await this.connectDBSync();
     // Connect to local redis server
     await this.connectRedisSync();
@@ -51,7 +51,7 @@ export class SyncServer {
   }
 
   async connectDBSync() {
-    await connectDB();
+    await connectPrisma();
   }
 
   async connectRedisSync() {

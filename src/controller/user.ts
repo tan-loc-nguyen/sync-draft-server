@@ -1,59 +1,14 @@
-import { mongo, Types } from "mongoose";
-import { User, UserModel } from "../model";
+import { prisma } from '../config/prisma.js';
+import { UserModel } from '../generated/prisma/models.js';
 
-export const getUserById = async (userId: string): Promise<User>  => {
-  const user = await UserModel.findOne({ userId: userId}).exec();
+export const getUserById = async (userId: string): Promise<UserModel | null> =>
+  prisma.user.findUnique({ where: { userId } });
 
-  return user;
-}
-
-
-export const createUser = async (email: string, userId: string): Promise<User> => {
-  const user = await getUserById(userId);
-
-  if (!user) {
-    console.log('creating user: ', userId, email)
-
-    const newUser = await (new UserModel({
-      _id: new mongo.ObjectId(),
-      userId: userId,
-      email: email,
-      createdAt: new Date(),
-      documents: [],
-      shared: []
-    }))
-    .save();
-
-    return newUser;
-  }
-
-  throw new Error('User already exists');  
-}
-
-export const addSharedIdToProfile = async (userId: string, docId: Types.ObjectId | string) => {
-  const addedNewShared = await UserModel.findOneAndUpdate(
-    {
-      userId: userId
-    },
-    {
-      $addToSet: { shared: docId }
-    },
-    { new: true }
-  )
-
-  return addedNewShared;
-}
-
-export const removeSharedIdFromProfile = async (userId: string, docId: Types.ObjectId | string) => {
-  const removedShared = await UserModel.findOneAndUpdate(
-    {
-      userId: userId
-    },
-    {
-      $pull: { shared: docId }
-    },
-    { new: true }
-  );
-
-  return removedShared;
-};
+// Idempotent: the client posts a profile whenever it fails to read one, so a
+// repeat call must return the existing profile rather than fail.
+export const createUser = async (email: string, userId: string): Promise<UserModel> =>
+  prisma.user.upsert({
+    where: { userId },
+    create: { userId, email },
+    update: {},
+  });

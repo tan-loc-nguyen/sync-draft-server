@@ -1,5 +1,5 @@
 import { auth } from "express-oauth2-jwt-bearer";
-import 'dotenv/config';
+import '../config/env.js';
 
 export const jwtMiddleware = auth({
   audience: process.env.AUTH0_AUDIENCE,

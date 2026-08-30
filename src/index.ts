@@ -1,7 +1,5 @@
-import { SyncServer } from "./server";
-import * as dotenv from "dotenv";
-
-dotenv.config();
+import "./config/env.js";
+import { SyncServer } from "./server.js";
 
 try {
   const syncServer = new SyncServer();
