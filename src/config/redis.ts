@@ -2,7 +2,11 @@ import { Redis } from "ioredis";
 
 async function connectRedis() {
   try {
-    const redis = new Redis(process.env.REDIS_URI || '', {
+    // Hosted Redis add-ons inject REDIS_URL; REDIS_URI is kept for local setups
+    // that predate that.
+    const connectionString = process.env.REDIS_URL || process.env.REDIS_URI || '';
+
+    const redis = new Redis(connectionString, {
       // port: parseInt(process.env.REDIS_PORT) || 6379, // Redis port
       // host: process.env.REDIS_HOST || '', // Redis host
       // username: "default", // needs Redis >= 6
