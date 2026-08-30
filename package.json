@@ -20,6 +20,7 @@
     "@automerge/automerge": "^3",
     "@prisma/adapter-pg": "^7.10.0",
     "@prisma/client": "7.10.0",
+    "@socket.io/redis-adapter": "^8.3.0",
     "cors": "^2.8.6",
     "dotenv": "^17",
     "express": "^5",

@@ -1,5 +1,7 @@
+import { randomUUID } from 'crypto';
 import { Redis } from 'ioredis';
 import { Server, Socket } from 'socket.io';
+import { createAdapter } from '@socket.io/redis-adapter';
 import * as A from '@automerge/automerge';
 
 import { assertCanEdit, getDocumentContent, updateDocument } from '../controller/document.js';
@@ -9,13 +11,32 @@ import { createDoc, SyncDoc } from './document-sync.js';
 const roomOf = (docId: string) => `room_${docId}`;
 const docKey = (docId: string) => `doc:${docId}`;
 
+// Document changes are fanned out to the other server instances here. The
+// Socket.IO adapter has its own channels; this one carries CRDT changes.
+const CHANGE_CHANNEL = 'syncdraft:doc-changes';
+
 // How long to batch document changes before writing them through to storage.
 const PERSIST_DELAY_MS = 500;
 
-// Drops a user from a document's presence set, but only once none of their other
-// sockets remain in the room. A user can hold several sockets at once (multiple
-// tabs), and closing one must not evict them from the document.
-// Returns true only if the user was actually removed.
+// How long to wait before dropping someone from a document's presence list.
+// Hosts that recycle connections (Vercel closes a socket when its Function
+// reaches maximum duration) would otherwise make every collaborator blink out
+// of the list and back on a timer.
+const PRESENCE_GRACE_MS = Number(process.env.PRESENCE_GRACE_MS ?? 10_000);
+
+interface ChangeBroadcast {
+  docId: string;
+  /** The instance that produced these changes, so it can ignore its own echo. */
+  origin: string;
+  changes: string[];
+}
+
+/**
+ * Drops a user from a document's presence set, but only once none of their other
+ * sockets remain in the room — including sockets held by other server
+ * instances, which the Redis adapter makes `fetchSockets` aware of.
+ * Returns true only if the user was actually removed.
+ */
 const releasePresence = async (
   io: Server,
   redis: Redis,
@@ -40,38 +61,78 @@ export default async (
   redis: Redis,
   verifyToken: TokenVerifier = createAuth0TokenVerifier()
 ) => {
-  // Working copy of every open document, plus one Automerge sync state per
-  // connected socket. Sync state is per-peer by design: it records what that
-  // particular peer is already known to have.
+  // Identifies this server instance so it can ignore changes it published.
+  const instanceId = randomUUID();
+
+  // Rooms, broadcasts and fetchSockets only reach the sockets held by one
+  // process unless every instance shares an adapter.
+  //
+  // Only subscribers need their own connection: a client in subscriber mode
+  // cannot issue ordinary commands, while publishing is an ordinary command. So
+  // `redis` doubles as the publisher for both channels and each instance costs
+  // three connections rather than five — which matters on a hosted Redis with a
+  // low connection ceiling.
+  const adapterSub = redis.duplicate();
+  const changeSub = redis.duplicate();
+  io.adapter(createAdapter(redis, adapterSub));
+
+  // This instance's working copy of each open document, plus one Automerge sync
+  // state per connected socket. Sync state is per-peer by design: it records
+  // what that particular peer is already known to have. A socket stays pinned
+  // to the instance that accepted it, so keeping its state in memory is safe.
   const documents = new Map<string, A.Doc<SyncDoc>>();
   const peers = new Map<string, Map<string, { socket: Socket; state: A.SyncState }>>();
   const pendingSaves = new Map<string, NodeJS.Timeout>();
+  const presenceTimers = new Map<string, NodeJS.Timeout>();
 
   const loadDocument = async (docId: string): Promise<A.Doc<SyncDoc>> => {
     const cached = documents.get(docId);
     if (cached) return cached;
 
-    const saved = await redis.getBuffer(docKey(docId));
+    let saved = await redis.getBuffer(docKey(docId));
 
-    // A document opened for the first time since the CRDT rollout is seeded
-    // from the HTML already in Postgres, so nothing written earlier is lost.
-    const doc = saved
-      ? A.load<SyncDoc>(new Uint8Array(saved))
-      : createDoc((await getDocumentContent(docId)) ?? '');
+    if (!saved) {
+      // A document opened for the first time since the CRDT rollout is seeded
+      // from the HTML already in Postgres, so nothing written earlier is lost.
+      //
+      // Exactly one instance may do this. Two instances each calling createDoc
+      // would produce documents with no common ancestor, and changes from one
+      // could never apply to the other — the very collision this whole design
+      // exists to avoid. SET NX picks a single winner; everyone else adopts the
+      // winner's document.
+      const seeded = createDoc((await getDocumentContent(docId)) ?? '');
+      const won = await redis.set(docKey(docId), Buffer.from(A.save(seeded)), 'NX');
 
+      if (won) {
+        documents.set(docId, seeded);
+        return seeded;
+      }
+
+      saved = await redis.getBuffer(docKey(docId));
+    }
+
+    const doc = A.load<SyncDoc>(new Uint8Array(saved!));
     documents.set(docId, doc);
     return doc;
   };
 
   const persist = async (docId: string) => {
-    const doc = documents.get(docId);
-    if (!doc) return;
+    const local = documents.get(docId);
+    if (!local) return;
 
     try {
+      // Another instance may have written since this copy was loaded. Merging
+      // what is stored into the local copy before saving means a concurrent
+      // write adds to the document rather than replacing it.
+      const stored = await redis.getBuffer(docKey(docId));
+      const merged = stored ? A.merge(A.load<SyncDoc>(new Uint8Array(stored)), local) : local;
+
+      documents.set(docId, merged);
+
       // Redis holds the full CRDT (history included); Postgres keeps the
       // rendered HTML so listings and first loads stay cheap.
-      await redis.set(docKey(docId), Buffer.from(A.save(doc)));
-      await updateDocument(docId, doc.content ?? '');
+      await redis.set(docKey(docId), Buffer.from(A.save(merged)));
+      await updateDocument(docId, merged.content ?? '');
     } catch (error) {
       console.error(`[Error] persist doc[${docId}]: ${error}`);
     }
@@ -112,6 +173,52 @@ export default async (
     }
   };
 
+  const pushToLocalPeers = (docId: string, exceptSocketId?: string) => {
+    peersFor(docId).forEach((peer, id) => {
+      if (id !== exceptSocketId) pushTo(docId, peer);
+    });
+  };
+
+  const publishChanges = (docId: string, changes: A.Change[]) => {
+    if (!changes.length) return;
+
+    const payload: ChangeBroadcast = {
+      docId,
+      origin: instanceId,
+      changes: changes.map((change) => Buffer.from(change).toString('base64')),
+    };
+
+    redis.publish(CHANGE_CHANNEL, JSON.stringify(payload)).catch((error) => {
+      console.error(`[Error] publish changes doc[${docId}]: ${error}`);
+    });
+  };
+
+  await changeSub.subscribe(CHANGE_CHANNEL);
+  changeSub.on('message', (_channel: string, raw: string) => {
+    try {
+      const payload = JSON.parse(raw) as ChangeBroadcast;
+
+      // Our own changes have already been applied locally.
+      if (payload.origin === instanceId) return;
+
+      const current = documents.get(payload.docId);
+      // Nobody here is in that document, so there is nothing to update. The
+      // changes are still in Redis for whenever it is next opened.
+      if (!current) return;
+
+      const [updated] = A.applyChanges(
+        current,
+        payload.changes.map((change) => new Uint8Array(Buffer.from(change, 'base64')))
+      );
+
+      documents.set(payload.docId, updated);
+      pushToLocalPeers(payload.docId);
+      schedulePersist(payload.docId);
+    } catch (error) {
+      console.error(`[Error] applying broadcast changes: ${error}`);
+    }
+  });
+
   // Socket.IO never runs Express middleware, so the handshake is authenticated
   // here. Identity comes from the verified token and is never taken from a
   // client-supplied payload.
@@ -133,7 +240,6 @@ export default async (
 
   io.on('connection', async (socket) => {
     const userId = socket.data.userId as string;
-    console.log(`[Socket] ${socket.id} connected as ${userId}`);
 
     socket.on('join-doc', async ({ docId }: { docId: string }) => {
       try {
@@ -144,6 +250,15 @@ export default async (
         const room = roomOf(docId);
         socket.join(room);
         socket.data.docId = docId;
+
+        // Back from a recycled connection within the grace window: cancel the
+        // pending removal so other collaborators never saw them leave.
+        const presenceKey = `${room}|${userId}`;
+        const pending = presenceTimers.get(presenceKey);
+        if (pending) {
+          clearTimeout(pending);
+          presenceTimers.delete(presenceKey);
+        }
 
         await redis.sadd(room, userId);
 
@@ -157,8 +272,6 @@ export default async (
 
         const usersInDoc = await redis.smembers(room);
         io.to(room).emit('online-users', usersInDoc);
-
-        console.log(`[Socket] ${userId} joined ${room} (${usersInDoc.length} online)`);
       } catch (error) {
         console.error(`[Error] join-doc | ${docId}: ${error}`);
         socket.emit('doc-error', { message: 'You do not have access to this document' });
@@ -173,8 +286,7 @@ export default async (
       if (!docId) return;
 
       try {
-        const group = peersFor(docId);
-        const entry = group.get(socket.id);
+        const entry = peersFor(docId).get(socket.id);
         if (!entry) return;
 
         const current = await loadDocument(docId);
@@ -187,11 +299,13 @@ export default async (
         documents.set(docId, updated);
         entry.state = nextState;
 
-        // Answer the sender, then bring every other peer in the room up to date.
+        // Answer the sender, then bring every other peer here up to date.
         pushTo(docId, entry);
-        group.forEach((peer, id) => {
-          if (id !== socket.id) pushTo(docId, peer);
-        });
+        pushToLocalPeers(docId, socket.id);
+
+        // Collaborators are routinely spread across instances, so anything new
+        // has to reach the others too.
+        publishChanges(docId, A.getChanges(current, updated));
 
         schedulePersist(docId);
       } catch (error) {
@@ -203,28 +317,43 @@ export default async (
       if (!docId) return;
 
       const room = roomOf(docId);
+      const socketId = socket.id;
       socket.leave(room);
-      peers.get(docId)?.delete(socket.id);
+      peers.get(docId)?.delete(socketId);
 
-      const removed = await releasePresence(io, redis, room, userId, socket.id);
-
-      if (removed) {
-        const usersInDoc = await redis.smembers(room);
-        socket.broadcast.to(room).emit('online-users', usersInDoc);
-      }
-
-      // Nobody left in the room: flush and drop the working copy.
       if (peers.get(docId)?.size === 0) {
         peers.delete(docId);
         await persist(docId);
         documents.delete(docId);
       }
+
+      // Hold the presence entry briefly: a recycled connection is back within
+      // seconds, and evicting immediately would flash them out of everyone's
+      // collaborator list on a timer.
+      const presenceKey = `${room}|${userId}`;
+      clearTimeout(presenceTimers.get(presenceKey));
+      presenceTimers.set(
+        presenceKey,
+        setTimeout(async () => {
+          presenceTimers.delete(presenceKey);
+
+          try {
+            const removed = await releasePresence(io, redis, room, userId, socketId);
+
+            if (removed) {
+              const usersInDoc = await redis.smembers(room);
+              io.to(room).emit('online-users', usersInDoc);
+            }
+          } catch (error) {
+            console.error(`[Error] presence release | ${docId}: ${error}`);
+          }
+        }, PRESENCE_GRACE_MS)
+      );
     };
 
     socket.on('leave-doc', async ({ docId }: { docId: string }) => {
       try {
         await leave(docId);
-        console.log(`[Socket] ${userId} left ${roomOf(docId)}`);
       } catch (error) {
         console.error(`[Error] leave-doc | ${docId}: ${error}`);
       }
@@ -233,7 +362,6 @@ export default async (
     socket.on('disconnect', async () => {
       try {
         await leave(socket.data.docId as string | undefined);
-        console.log(`[Socket] ${socket.id} disconnected`);
       } catch (error) {
         console.error(`[Error] disconnect | ${socket.id}: ${error}`);
       }
